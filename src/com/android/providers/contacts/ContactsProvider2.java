@@ -1529,6 +1529,14 @@ public class ContactsProvider2 extends AbstractContactsProvider
             new ThreadLocal<TransactionContext>();
     private final ThreadLocal<LogFields.Builder> mLogFieldsBuilderHolder = new ThreadLocal<>();
 
+    /**
+     * IchthysOS: contacts lockdown. Non-null while the query running on this thread is for a
+     * restricted caller: {@link #READ_SHIELD_PENDING} until {@link #queryLocal} has run it with
+     * an always-false selection, then the cursor that came out of that.
+     */
+    private final ThreadLocal<Object> mReadShield = new ThreadLocal<>();
+    private static final Object READ_SHIELD_PENDING = new Object();
+
     // Random number generator.
     private final SecureRandom mRandom = new SecureRandom();
 
@@ -2548,6 +2556,11 @@ public class ContactsProvider2 extends AbstractContactsProvider
                         + "for the user");
                 return rejectInsert(uri, values);
             }
+            if (isContactsWriteRestricted()) {
+                // IchthysOS: contacts write shield. Answered like a stock app-op denial.
+                Log.i(TAG, "Shielded insert with uri [" + uri + "] from " + getCallingPackage());
+                return rejectInsert(uri, values);
+            }
             if (mapsToProfileDbWithInsertedValues(uri, values)) {
                 switchToProfileMode();
                 resultUri = mProfileProvider.insert(uri, values);
@@ -2595,6 +2608,11 @@ public class ContactsProvider2 extends AbstractContactsProvider
                         + "for the user");
                 return 0;
             }
+            if (isContactsWriteRestricted()) {
+                // IchthysOS: contacts write shield. Answered like a stock app-op denial.
+                Log.i(TAG, "Shielded update with uri [" + uri + "] from " + getCallingPackage());
+                return 0;
+            }
             if (mapsToProfileDb(uri)) {
                 switchToProfileMode();
                 updates = mProfileProvider.update(uri, values, selection, selectionArgs);
@@ -2632,6 +2650,11 @@ public class ContactsProvider2 extends AbstractContactsProvider
                 // Returning 0, no rows were deleted as writes are disabled
                 Log.w(TAG, "Blocked delete with uri [" + uri + "]. Contact writes not enabled "
                         + "for the user");
+                return 0;
+            }
+            if (isContactsWriteRestricted()) {
+                // IchthysOS: contacts write shield. Answered like a stock app-op denial.
+                Log.i(TAG, "Shielded delete with uri [" + uri + "] from " + getCallingPackage());
                 return 0;
             }
             if (mapsToProfileDb(uri)) {
@@ -3257,6 +3280,11 @@ public class ContactsProvider2 extends AbstractContactsProvider
             // Returning 0, no rows were affected since writes are disabled
             Log.w(TAG, "Blocked bulkInsert with uri [" + uri + "]. Contact writes not enabled "
                     + "for the user");
+            return 0;
+        }
+        if (isContactsWriteRestricted()) {
+            // IchthysOS: contacts write shield. Answered like a stock app-op denial.
+            Log.i(TAG, "Shielded bulkInsert with uri [" + uri + "] from " + getCallingPackage());
             return 0;
         }
         return super.bulkInsert(uri, values);
@@ -6258,10 +6286,24 @@ public class ContactsProvider2 extends AbstractContactsProvider
                 .setStartNanos(SystemClock.elapsedRealtimeNanos())
                 .setUid(Binder.getCallingUid());
 
+        // IchthysOS: contacts lockdown. A restricted caller reads a new phone's address book.
+        // queryLocal() gets there by adding an always-false selection, so that the real query is
+        // not run and aggregates (count(*), _count) answer what an empty table answers.
+        final boolean readRestricted = isContactsReadRestricted();
+        final Object outerReadShield = mReadShield.get();
+        mReadShield.set(readRestricted ? READ_SHIELD_PENDING : null);
+
         Cursor cursor = null;
         try {
             cursor = queryInternal(uri, projection, selection, selectionArgs, sortOrder,
                     cancellationSignal);
+            if (cursor != null && readRestricted && cursor != mReadShield.get()) {
+                // A path that takes no selection (merged or remote directories, phone lookup,
+                // the legacy API, ...): same columns, no rows.
+                final Cursor real = cursor;
+                cursor = new MatrixCursor(real.getColumnNames(), 0);
+                real.close();
+            }
             if (cursor != null) {
                 // Consuming the cursor allows the actual exception (if any) thrown to be
                 // caught in the exception block below.
@@ -6273,6 +6315,7 @@ public class ContactsProvider2 extends AbstractContactsProvider
             logBuilder.setException(e);
             throw e;
         } finally {
+            mReadShield.set(outerReadShield);
             LogUtils.log(logBuilder.build());
         }
     }
@@ -6465,6 +6508,29 @@ public class ContactsProvider2 extends AbstractContactsProvider
      * The ContactsProvider instance running in the clone profile should block inserts, updates
      * and deletes and hence should return false.
      */
+    /**
+     * IchthysOS: whether the current caller reads an empty address book, see
+     * {@link IchthysShield#FEATURE_CONTACTS}. Called on the incoming binder thread.
+     */
+    private boolean isContactsReadRestricted() {
+        // A caller without READ_CONTACTS can only have got here through a URI grant (a contact
+        // from the picker, a shared vCard): what it was handed stays readable.
+        if (getContext().checkCallingPermission(READ_PERMISSION) != PERMISSION_GRANTED) {
+            return false;
+        }
+        return IchthysShield.isCallerRestricted(getContext(),
+                IchthysShield.FEATURE_CONTACTS, getCallingPackage());
+    }
+
+    /**
+     * IchthysOS: whether the current caller's contact writes must be turned into no-ops, see
+     * {@link IchthysShield#FEATURE_CONTACTS_WRITE}. Called on the incoming binder thread.
+     */
+    private boolean isContactsWriteRestricted() {
+        return IchthysShield.isCallerRestricted(getContext(),
+                IchthysShield.FEATURE_CONTACTS_WRITE, getCallingPackage());
+    }
+
     @VisibleForTesting
     protected boolean areContactWritesEnabled() {
         return !isContactSharingEnabledForCloneProfile() ||
@@ -8175,11 +8241,20 @@ public class ContactsProvider2 extends AbstractContactsProvider
 
         qb.setStrict(true);
 
+        // IchthysOS: contacts lockdown, see query().
+        final boolean readShielded = mReadShield.get() != null;
+        if (readShielded) {
+            selection = DbQueryUtils.concatenateClauses(selection, "0");
+        }
+
         // Auto-rewrite SORT_KEY_{PRIMARY, ALTERNATIVE} sort orders.
         String localizedSortOrder = getLocalizedSortOrder(sortOrder);
         Cursor cursor =
                 doQuery(db, qb, projection, selection, selectionArgs, localizedSortOrder, groupBy,
                         having, limit, cancellationSignal);
+        if (readShielded) {
+            mReadShield.set(cursor);
+        }
 
         if (readBooleanQueryParameter(uri, Contacts.EXTRA_ADDRESS_BOOK_INDEX, false)) {
             bundleFastScrollingIndexExtras(cursor, uri, db, qb, selection,
@@ -9759,6 +9834,16 @@ public class ContactsProvider2 extends AbstractContactsProvider
             if (!mode.equals("r") && !areContactWritesEnabled()) {
                 Log.w(TAG, "Blocked openAssetFile with uri [" + uri + "]. Contact writes not "
                         + "enabled for the user");
+                return null;
+            }
+            if (mode.equals("r") && isContactsReadRestricted()) {
+                // IchthysOS: contacts lockdown, the photo and vCard half.
+                return null;
+            }
+            if (!mode.equals("r") && isContactsWriteRestricted()) {
+                // IchthysOS: contacts write shield, the photo-writing half.
+                Log.i(TAG, "Shielded openAssetFile with uri [" + uri + "] from "
+                        + getCallingPackage());
                 return null;
             }
             if (!isDirectoryParamValid(uri)){

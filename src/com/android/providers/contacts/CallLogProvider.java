@@ -36,6 +36,7 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.OperationApplicationException;
 import android.content.UriMatcher;
+import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.database.DatabaseUtils;
 import android.database.sqlite.SQLiteDatabase;
@@ -559,6 +560,20 @@ public class CallLogProvider extends ContentProvider {
                 throw new IllegalArgumentException("Unknown URL " + uri);
         }
 
+        // IchthysOS: call log shield. An app that holds READ_CALL_LOG but is not the dialer, the
+        // SMS app or explicitly allowed sees the log of a phone that has never made a call: same
+        // columns, same notification URI, no rows. A VoIP app reading its own calls
+        // (CALLS_VOIP) is already scoped to them and keeps its answer. So does a caller without
+        // READ_CALL_LOG, which can only have got here through a URI grant.
+        if (match != CALLS_VOIP
+                && getContext().checkCallingPermission(
+                        android.Manifest.permission.READ_CALL_LOG)
+                                == PackageManager.PERMISSION_GRANTED
+                && IchthysShield.isRestricted(getContext(),
+                        IchthysShield.FEATURE_CALL_LOG, uid, getCallingPackage())) {
+            selectionBuilder.addClause("0");
+        }
+
         final int limit = getIntParam(uri, Calls.LIMIT_PARAM_KEY, 0);
         final int offset = getIntParam(uri, Calls.OFFSET_PARAM_KEY, 0);
         String limitClause = null;
@@ -739,6 +754,11 @@ public class CallLogProvider extends ContentProvider {
 
         mStats.incrementInsertStats(callingUid, applyingBatch());
         try {
+            // IchthysOS: call log write shield. A restricted app's insert goes the way of a stock
+            // app-op denial: it gets a plausible URI back and nothing is written.
+            if (isCallLogWriteRestricted(callingUid)) {
+                return rejectInsert(uri, values);
+            }
             return insertInternal(uri, values);
         } finally {
             mStats.finishOperation(callingUid);
@@ -752,6 +772,10 @@ public class CallLogProvider extends ContentProvider {
 
         mStats.incrementUpdateStats(callingUid, applyingBatch());
         try {
+            // IchthysOS: call log write shield, see insert().
+            if (isCallLogWriteRestricted(callingUid)) {
+                return 0;
+            }
             return updateInternal(uri, values, selection, selectionArgs);
         } finally {
             mStats.finishOperation(callingUid);
@@ -765,10 +789,24 @@ public class CallLogProvider extends ContentProvider {
 
         mStats.incrementDeleteStats(callingUid, applyingBatch());
         try {
+            // IchthysOS: call log write shield, see insert(). This is what keeps an app from
+            // quietly wiping the evidence of the calls it placed.
+            if (isCallLogWriteRestricted(callingUid)) {
+                return 0;
+            }
             return deleteInternal(uri, selection, selectionArgs);
         } finally {
             mStats.finishOperation(callingUid);
         }
+    }
+
+    /**
+     * IchthysOS: whether a call log write from {@code callingUid} must be turned into a no-op,
+     * see {@link IchthysShield#FEATURE_CALL_LOG_WRITE}.
+     */
+    private boolean isCallLogWriteRestricted(int callingUid) {
+        return IchthysShield.isRestricted(getContext(), IchthysShield.FEATURE_CALL_LOG_WRITE,
+                callingUid, getCallingPackage());
     }
 
     private Uri insertInternal(Uri uri, ContentValues values) {
