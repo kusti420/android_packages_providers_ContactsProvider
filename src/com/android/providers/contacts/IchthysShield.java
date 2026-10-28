@@ -170,6 +170,12 @@ public final class IchthysShield {
     }
 
     private static boolean isEnabled(Context context, String feature) {
+        // IchthysOS: the write shield is part of the contacts lockdown. With the lockdown off
+        // (Guard, or the permission screen's switch, which only writes the Global key) sync apps
+        // such as DAVx5 had their contact writes silently dropped.
+        if (FEATURE_CONTACTS_WRITE.equals(feature) && !isEnabled(context, FEATURE_CONTACTS)) {
+            return false;
+        }
         if (FEATURE_CONTACTS.equals(feature)) {
             try {
                 return Settings.Global.getInt(
