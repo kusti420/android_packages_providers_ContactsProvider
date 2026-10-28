@@ -6308,7 +6308,7 @@ public class ContactsProvider2 extends AbstractContactsProvider
         // IchthysOS: contacts lockdown. A restricted caller reads a new phone's address book.
         // queryLocal() gets there by adding an always-false selection, so that the real query is
         // not run and aggregates (count(*), _count) answer what an empty table answers.
-        final boolean readRestricted = isContactsReadRestricted();
+        final boolean readRestricted = isContactsReadRestricted(uri);
         final Object outerReadShield = mReadShield.get();
         mReadShield.set(readRestricted ? READ_SHIELD_PENDING : null);
 
@@ -6540,6 +6540,56 @@ public class ContactsProvider2 extends AbstractContactsProvider
         return IchthysShield.isCallerRestricted(getContext(),
                 IchthysShield.FEATURE_CONTACTS, getCallingPackage());
     }
+
+    /**
+     * IchthysOS: {@link #isContactsReadRestricted()} for a read of {@code uri}. A caller holding
+     * only a URI grant reads what a grant is for, one contact or row (the picker's, a shared
+     * vCard), but not a whole table: a shielded app could otherwise grant its companion app the
+     * provider's root and have it read the real address book.
+     */
+    private boolean isContactsReadRestricted(Uri uri) {
+        if (getContext().checkCallingPermission(READ_PERMISSION) != PERMISSION_GRANTED) {
+            return !GRANTABLE_ITEM_MATCHES.contains(sUriMatcher.match(uri))
+                    || hasBroadGrant(uri);
+        }
+        return IchthysShield.isCallerRestricted(getContext(),
+                IchthysShield.FEATURE_CONTACTS, getCallingPackage());
+    }
+
+    /**
+     * IchthysOS: whether the caller's grant reaches beyond {@code uri}: it also holds one on a
+     * parent path (the provider's root, "contacts/"...), which a prefix grant does and a grant
+     * of one item doesn't. With one it could walk every id.
+     */
+    private boolean hasBroadGrant(Uri uri) {
+        final int pid = Binder.getCallingPid();
+        final int uid = Binder.getCallingUid();
+        final List<String> segments = uri.getPathSegments();
+        final StringBuilder path = new StringBuilder("/");
+        for (int i = 0; i < segments.size(); i++) {
+            final Uri parent = new Uri.Builder().scheme(uri.getScheme())
+                    .encodedAuthority(uri.getEncodedAuthority()).encodedPath(path.toString())
+                    .build();
+            if (getContext().checkUriPermission(parent, pid, uid,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION) == PERMISSION_GRANTED) {
+                return true;
+            }
+            path.append(Uri.encode(segments.get(i))).append('/');
+        }
+        return false;
+    }
+
+    /** IchthysOS: the URIs that name one contact, raw contact, data row or photo. */
+    private static final Set<Integer> GRANTABLE_ITEM_MATCHES = Set.of(
+            CONTACTS_ID, CONTACTS_LOOKUP, CONTACTS_LOOKUP_ID, CONTACTS_ID_DATA,
+            CONTACTS_ID_PHOTO, CONTACTS_LOOKUP_PHOTO, CONTACTS_LOOKUP_ID_PHOTO,
+            CONTACTS_ID_DISPLAY_PHOTO, CONTACTS_LOOKUP_DISPLAY_PHOTO,
+            CONTACTS_LOOKUP_ID_DISPLAY_PHOTO, CONTACTS_AS_VCARD, CONTACTS_AS_MULTI_VCARD,
+            CONTACTS_LOOKUP_DATA, CONTACTS_LOOKUP_ID_DATA, CONTACTS_ID_ENTITIES,
+            CONTACTS_LOOKUP_ENTITIES, CONTACTS_LOOKUP_ID_ENTITIES, CONTACTS_ID_PHOTO_CORP,
+            CONTACTS_ID_DISPLAY_PHOTO_CORP, RAW_CONTACTS_ID, RAW_CONTACTS_ID_DATA,
+            RAW_CONTACTS_ID_DISPLAY_PHOTO, DATA_ID, PHONES_ID, EMAILS_ID, POSTALS_ID,
+            CALLABLES_ID, DISPLAY_PHOTO_ID);
 
     /**
      * IchthysOS: whether the current caller's contact writes must be turned into no-ops, see
@@ -9855,7 +9905,7 @@ public class ContactsProvider2 extends AbstractContactsProvider
                         + "enabled for the user");
                 return null;
             }
-            if (mode.equals("r") && isContactsReadRestricted()) {
+            if (mode.equals("r") && isContactsReadRestricted(uri)) {
                 // IchthysOS: contacts lockdown, the photo and vCard half.
                 return null;
             }
