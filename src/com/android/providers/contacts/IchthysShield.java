@@ -136,7 +136,9 @@ public final class IchthysShield {
             if (!isEnabled(context, feature)) {
                 return false;
             }
-            if (ALWAYS_ALLOWED_PACKAGES.contains(packageName)
+            // A name on the list counts only for the preinstalled app: com.android.contacts isn't
+            // installed here, and any sideloaded app could take that name.
+            if ((ALWAYS_ALLOWED_PACKAGES.contains(packageName) && isSystemApp(context, uid))
                     || isUserAllowed(context, feature, packageName)) {
                 return false;
             }
