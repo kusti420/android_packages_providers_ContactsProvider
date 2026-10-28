@@ -2695,6 +2695,25 @@ public class ContactsProvider2 extends AbstractContactsProvider
         }
         switchToContactMode();
 
+        // IchthysOS contacts shield: a shielded app gets a fresh phone's answer to the account
+        // questions too (no default account, no SIM accounts), not the owner's account e-mail.
+        if ((Settings.QUERY_DEFAULT_ACCOUNT_METHOD.equals(method)
+                        || DefaultAccount.QUERY_DEFAULT_ACCOUNT_FOR_NEW_CONTACTS_METHOD.equals(method)
+                        || SimContacts.QUERY_SIM_ACCOUNTS_METHOD.equals(method))
+                && isContactsReadRestricted()) {
+            ContactsPermissions.enforceCallingOrSelfPermission(getContext(), READ_PERMISSION);
+            final Bundle fresh = new Bundle();
+            if (Settings.QUERY_DEFAULT_ACCOUNT_METHOD.equals(method)) {
+                fresh.putParcelable(Settings.KEY_DEFAULT_ACCOUNT, null);
+            } else if (SimContacts.QUERY_SIM_ACCOUNTS_METHOD.equals(method)) {
+                fresh.putParcelableList(SimContacts.KEY_SIM_ACCOUNTS, new ArrayList<SimAccount>());
+            } else {
+                fresh.putInt(DefaultAccount.KEY_DEFAULT_ACCOUNT_STATE,
+                        DefaultAccountAndState.DEFAULT_ACCOUNT_STATE_NOT_SET);
+            }
+            return fresh;
+        }
+
         boolean enableCallMethodLogging = logCallMethod();
 
         if (Authorization.AUTHORIZATION_METHOD.equals(method)) {
