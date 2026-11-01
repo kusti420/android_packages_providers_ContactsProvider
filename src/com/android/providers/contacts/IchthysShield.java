@@ -28,6 +28,9 @@ import android.telecom.TelecomManager;
 import android.text.TextUtils;
 import android.util.Log;
 
+import com.android.internal.ichthys.guard.GuardEvent;
+import com.android.internal.ichthys.guard.GuardShieldReporter;
+
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -151,9 +154,25 @@ public final class IchthysShield {
             if (isSystemApp(context, uid)) {
                 return false;
             }
-            return !isDefaultDialerOrSms(context, packageName);
+            final boolean restricted = !isDefaultDialerOrSms(context, packageName);
+            if (restricted) {
+                // IchthysOS: evidence for Guard ("Contacts shielded for X"); rate-limited there.
+                GuardShieldReporter.note(uid, shieldCode(feature), feature);
+            }
+            return restricted;
         } finally {
             Binder.restoreCallingIdentity(token);
+        }
+    }
+
+    /** The GuardEvent.SHIELD_* code of {@code feature}. */
+    private static int shieldCode(String feature) {
+        switch (feature) {
+            case FEATURE_CONTACTS: return GuardEvent.SHIELD_CONTACTS;
+            case FEATURE_CONTACTS_WRITE: return GuardEvent.SHIELD_CONTACTS_WRITE;
+            case FEATURE_CALL_LOG: return GuardEvent.SHIELD_CALL_LOG;
+            case FEATURE_CALL_LOG_WRITE: return GuardEvent.SHIELD_CALL_LOG_WRITE;
+            default: return 0;
         }
     }
 
