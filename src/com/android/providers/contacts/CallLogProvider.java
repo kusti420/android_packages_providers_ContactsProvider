@@ -571,7 +571,10 @@ public class CallLogProvider extends ContentProvider {
                                 == PackageManager.PERMISSION_GRANTED
                 && IchthysShield.isRestricted(getContext(),
                         IchthysShield.FEATURE_CALL_LOG, uid, getCallingPackage())) {
-            selectionBuilder.addClause("0");
+            // On the builder, not in the selection string: the builder is strict, so the
+            // caller's selection is validated alone and can't regroup this clause (a selection
+            // "1) OR (1" did exactly that when the two were concatenated).
+            qb.appendWhereStandalone("0");
         }
 
         final int limit = getIntParam(uri, Calls.LIMIT_PARAM_KEY, 0);

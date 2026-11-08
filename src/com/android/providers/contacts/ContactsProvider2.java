@@ -1537,6 +1537,19 @@ public class ContactsProvider2 extends AbstractContactsProvider
     private final ThreadLocal<Object> mReadShield = new ThreadLocal<>();
     private static final Object READ_SHIELD_PENDING = new Object();
 
+    /**
+     * IchthysOS: picked contacts. Set alongside {@link #mReadShield}: the sorted ids of the
+     * contacts a restricted caller in "picked" mode may read, null for an empty-book caller.
+     */
+    private final ThreadLocal<long[]> mPickedIds = new ThreadLocal<>();
+    private volatile IchthysPickedContacts mPickedContacts;
+
+    /** IchthysOS: call() methods with which Guard (Settings) reads and writes an app's picks. */
+    public static final String ICHTHYS_GET_PICKED = "ichthys_get_picked";
+    public static final String ICHTHYS_SET_PICKED = "ichthys_set_picked";
+    /** Bundle key of the picked lookup keys, an ArrayList of String. */
+    public static final String ICHTHYS_KEY_LOOKUPS = "lookups";
+
     // Random number generator.
     private final SecureRandom mRandom = new SecureRandom();
 
@@ -2687,6 +2700,10 @@ public class ContactsProvider2 extends AbstractContactsProvider
 
     @Override
     public Bundle call(String method, String arg, Bundle extras) {
+        // IchthysOS: Guard reads and writes the contacts picked for an app.
+        if (ICHTHYS_GET_PICKED.equals(method) || ICHTHYS_SET_PICKED.equals(method)) {
+            return callPickedContacts(method, arg, extras);
+        }
         waitForAccess(mReadAccessLatch);
         if (!areContactWritesEnabled()) {
             // Returning EMPTY Bundle since the call was rejected and no rows were affected
@@ -3474,6 +3491,8 @@ public class ContactsProvider2 extends AbstractContactsProvider
     };
 
     protected void notifyChange(boolean syncToNetwork) {
+        // IchthysOS: contact ids may have moved (join, split, delete): re-resolve the picks.
+        pickedContacts().onDataChanged();
         if (syncToNetwork) {
             // Changes to sync to network won't be rate limited.
             getContext().getContentResolver().notifyChange(ContactsContract.AUTHORITY_URI, null,
@@ -6257,6 +6276,14 @@ public class ContactsProvider2 extends AbstractContactsProvider
     @WorkerThread
     public void onPackageChanged(String packageName) {
         mContactDirectoryManager.onPackageChanged(packageName);
+        // IchthysOS: an uninstalled app's picked contacts go with it, so that another app
+        // installed later under the same name doesn't inherit them. An update is no removal:
+        // its PACKAGE_REMOVED arrives once the new version is installed.
+        try {
+            getContext().getPackageManager().getPackageInfo(packageName, 0);
+        } catch (PackageManager.NameNotFoundException e) {
+            pickedContacts().remove(packageName);
+        }
     }
 
     private void removeStaleAccountRows(String table, String accountNameColumn,
@@ -6311,16 +6338,38 @@ public class ContactsProvider2 extends AbstractContactsProvider
         final boolean readRestricted = isContactsReadRestricted(uri);
         final Object outerReadShield = mReadShield.get();
         mReadShield.set(readRestricted ? READ_SHIELD_PENDING : null);
+        // IchthysOS: picked contacts. A restricted caller in "picked" mode reads its picked
+        // contacts instead of nothing; queryLocal() turns the always-false clause into an id list.
+        final long[] picked = readRestricted ? pickedContactIdsForCaller() : null;
+        final long[] outerPicked = mPickedIds.get();
+        mPickedIds.set(picked);
+        // The paths filterPickedRows() filters need the contact id in their rows; it is added to
+        // the caller's projection here and taken out of the answer again.
+        final String pickedExtraColumn = picked != null ? pickedIdColumnToAdd(uri, projection) : null;
+        String[] queryProjection = projection;
+        if (pickedExtraColumn != null) {
+            queryProjection = Arrays.copyOf(projection, projection.length + 1);
+            queryProjection[projection.length] = pickedExtraColumn;
+        }
 
         Cursor cursor = null;
         try {
-            cursor = queryInternal(uri, projection, selection, selectionArgs, sortOrder,
+            cursor = queryInternal(uri, queryProjection, selection, selectionArgs, sortOrder,
                     cancellationSignal);
             if (cursor != null && readRestricted && cursor != mReadShield.get()) {
                 // A path that takes no selection (merged or remote directories, phone lookup,
                 // the legacy API, ...): same columns, no rows.
                 final Cursor real = cursor;
-                cursor = new MatrixCursor(real.getColumnNames(), 0);
+                final Uri notifyUri = real.getNotificationUri() != null
+                        ? real.getNotificationUri() : ContactsContract.AUTHORITY_URI;
+                // A "picked" caller keeps the rows of its picked contacts, where the rows say
+                // which contact they belong to; everyone else gets no rows.
+                cursor = picked != null
+                        ? filterPickedRows(real, uri, picked, pickedExtraColumn)
+                        : new MatrixCursor(real.getColumnNames(), 0);
+                // Same notification URI as the real answer, so a CursorLoader reloads when the
+                // data changes (and after Guard allows the app and the book changes next).
+                cursor.setNotificationUri(getContext().getContentResolver(), notifyUri);
                 real.close();
             }
             if (cursor != null) {
@@ -6335,6 +6384,7 @@ public class ContactsProvider2 extends AbstractContactsProvider
             throw e;
         } finally {
             mReadShield.set(outerReadShield);
+            mPickedIds.set(outerPicked);
             LogUtils.log(logBuilder.build());
         }
     }
@@ -6598,6 +6648,273 @@ public class ContactsProvider2 extends AbstractContactsProvider
     private boolean isContactsWriteRestricted() {
         return IchthysShield.isCallerRestricted(getContext(),
                 IchthysShield.FEATURE_CONTACTS_WRITE, getCallingPackage());
+    }
+
+    // ---- IchthysOS: picked contacts ------------------------------------------------------------
+
+    private IchthysPickedContacts pickedContacts() {
+        IchthysPickedContacts picked = mPickedContacts;
+        if (picked == null) {
+            synchronized (this) {
+                picked = mPickedContacts;
+                if (picked == null) {
+                    picked = new IchthysPickedContacts(getContext());
+                    mPickedContacts = picked;
+                }
+            }
+        }
+        return picked;
+    }
+
+    /**
+     * The sorted ids of the contacts picked for the calling app, or null when the caller is not
+     * in "picked" mode. Only for a caller {@link #isContactsReadRestricted} already restricted;
+     * one holding just a URI grant is never in picked mode.
+     */
+    private long[] pickedContactIdsForCaller() {
+        if (getContext().checkCallingPermission(READ_PERMISSION) != PERMISSION_GRANTED) {
+            return null;
+        }
+        final String pkg = getCallingPackage();
+        if (!IchthysShield.isContactsPicked(getContext(), pkg)) {
+            return null;
+        }
+        final SQLiteDatabase db = mContactsHelper.getReadableDatabase();
+        return pickedContacts().contactIds(pkg, key -> lookupContactIdByLookupKey(db, key));
+    }
+
+    /** queryLocal() matches whose rows are contacts: the contact id is {@code _id}. */
+    private static final Set<Integer> PICKED_CONTACT_ROWS = Set.of(
+            CONTACTS, CONTACTS_ID, CONTACTS_LOOKUP, CONTACTS_LOOKUP_ID, CONTACTS_MIMES,
+            CONTACTS_MIMES_FILTER, CONTACTS_AS_VCARD, CONTACTS_FILTER, CONTACTS_FREQUENT,
+            CONTACTS_GROUP, AGGREGATION_SUGGESTIONS);
+
+    /** queryLocal() matches whose rows belong to a contact named by {@code contact_id}. */
+    private static final Set<Integer> PICKED_CONTACT_ID_ROWS = Set.of(
+            CONTACTS_LOOKUP_DATA, CONTACTS_LOOKUP_ID_DATA, CONTACTS_LOOKUP_PHOTO,
+            CONTACTS_LOOKUP_ID_PHOTO, CONTACTS_ID_DATA, CONTACTS_ID_PHOTO, CONTACTS_ID_ENTITIES,
+            CONTACTS_LOOKUP_ENTITIES, CONTACTS_LOOKUP_ID_ENTITIES, PHONES, CALLABLES, PHONES_ID,
+            CALLABLES_ID, PHONES_FILTER, CALLABLES_FILTER, EMAILS, EMAILS_ID, EMAILS_LOOKUP,
+            EMAILS_FILTER, CONTACTABLES, CONTACTABLES_FILTER, POSTALS, POSTALS_ID, RAW_CONTACTS,
+            RAW_CONTACTS_ID, RAW_CONTACTS_ID_DATA, DATA, DATA_ID, RAW_CONTACT_ENTITIES,
+            RAW_CONTACT_ID_ENTITY);
+
+    /**
+     * The column that names the contact of each row for {@code match}, for the "picked" clause,
+     * or null when a picked app reads nothing there (the profile, groups, settings, stream items,
+     * directories, deleted contacts, ...). The names are the ones stock queryLocal() already uses
+     * unqualified in its own clauses for these tables.
+     */
+    private static String pickedContactColumn(int match) {
+        if (PICKED_CONTACT_ROWS.contains(match)) {
+            return Contacts._ID;
+        }
+        if (PICKED_CONTACT_ID_ROWS.contains(match)) {
+            return RawContacts.CONTACT_ID;
+        }
+        return null;
+    }
+
+    /**
+     * For a "picked" caller, the rows of {@code real} that belong to a picked contact, for the
+     * paths that run their own query (phone lookup, strequent, ...). Rows that don't say which
+     * contact they belong to, remote directories and the work profile give nothing. The real
+     * cursor's extras (address book index counts) are not passed on.
+     */
+    private Cursor filterPickedRows(Cursor real, Uri uri, long[] picked, String extraColumn) {
+        final String[] columns = real.getColumnNames();
+        // The id column query() added for this filter is not part of the answer: its last
+        // occurrence (the path may append columns of its own after it, phone lookup its number).
+        int extraIndex = -1;
+        if (extraColumn != null) {
+            for (int i = columns.length - 1; i >= 0; i--) {
+                if (extraColumn.equals(columns[i])) {
+                    extraIndex = i;
+                    break;
+                }
+            }
+        }
+        final int[] keep = new int[extraIndex < 0 ? columns.length : columns.length - 1];
+        for (int i = 0, k = 0; i < columns.length; i++) {
+            if (i != extraIndex) {
+                keep[k++] = i;
+            }
+        }
+        final String[] outColumns = new String[keep.length];
+        for (int k = 0; k < keep.length; k++) {
+            outColumns[k] = columns[keep[k]];
+        }
+        final MatrixCursor out = new MatrixCursor(outColumns);
+        final int match = sUriMatcher.match(uri);
+        final String directory = uri.getQueryParameter(ContactsContract.DIRECTORY_PARAM_KEY);
+        if (directory != null && !String.valueOf(Directory.DEFAULT).equals(directory)
+                && !String.valueOf(Directory.LOCAL_INVISIBLE).equals(directory)) {
+            return out;
+        }
+        final boolean contactRows = PICKED_CONTACT_ROWS.contains(match)
+                || match == PHONE_LOOKUP
+                || ((match == CONTACTS_STREQUENT || match == CONTACTS_STREQUENT_FILTER)
+                        && !readBooleanQueryParameter(
+                                uri, ContactsContract.STREQUENT_PHONE_ONLY, false));
+        if (!contactRows && !PICKED_CONTACT_ID_ROWS.contains(match)
+                && match != CONTACTS_STREQUENT && match != CONTACTS_STREQUENT_FILTER) {
+            return out;
+        }
+        int column = extraIndex >= 0 ? extraIndex : real.getColumnIndex(RawContacts.CONTACT_ID);
+        if (column < 0 && contactRows) {
+            column = real.getColumnIndex(Contacts._ID);
+        }
+        if (column < 0) {
+            return out;
+        }
+        real.moveToPosition(-1);
+        while (real.moveToNext()) {
+            if (real.isNull(column)
+                    || !IchthysPickedContacts.contains(picked, real.getLong(column))) {
+                continue;
+            }
+            final Object[] row = new Object[keep.length];
+            for (int k = 0; k < keep.length; k++) {
+                final int i = keep[k];
+                switch (real.getType(i)) {
+                    case Cursor.FIELD_TYPE_NULL: row[k] = null; break;
+                    case Cursor.FIELD_TYPE_INTEGER: row[k] = real.getLong(i); break;
+                    case Cursor.FIELD_TYPE_FLOAT: row[k] = real.getDouble(i); break;
+                    case Cursor.FIELD_TYPE_BLOB: row[k] = real.getBlob(i); break;
+                    default: row[k] = real.getString(i); break;
+                }
+            }
+            out.addRow(row);
+        }
+        return out;
+    }
+
+    /**
+     * For a "picked" caller, the contact id column to add to {@code projection} so that
+     * filterPickedRows() can filter a path that runs its own query, or null when the caller's
+     * projection is null (all columns, id included) or already names it. Phone lookup and
+     * strequent rows are contacts ({@code _id}); strequent's phone-only rows name theirs in
+     * {@code contact_id}.
+     */
+    private String pickedIdColumnToAdd(Uri uri, String[] projection) {
+        if (projection == null) {
+            return null;
+        }
+        final int match = sUriMatcher.match(uri);
+        final String column;
+        if (match == PHONE_LOOKUP) {
+            column = PhoneLookup._ID;
+        } else if (match == CONTACTS_STREQUENT || match == CONTACTS_STREQUENT_FILTER) {
+            column = readBooleanQueryParameter(uri, ContactsContract.STREQUENT_PHONE_ONLY, false)
+                    ? RawContacts.CONTACT_ID : Contacts._ID;
+        } else {
+            return null;
+        }
+        // Added even when the caller asked for it: then the last column is a duplicate the
+        // answer drops, and the caller's own copy stays where it asked for it.
+        return column;
+    }
+
+    /**
+     * Whether a "picked" caller may open {@code uri} for reading: a photo or vCard whose
+     * contacts are all picked for it. openAssetFileLocal() runs its own queries with the
+     * identity cleared, so this is the only check those reads get.
+     */
+    private boolean isPickedAsset(Uri uri) {
+        final long[] picked = pickedContactIdsForCaller();
+        if (picked == null || picked.length == 0) {
+            return false;
+        }
+        final SQLiteDatabase db = mContactsHelper.getReadableDatabase();
+        final List<String> segments = uri.getPathSegments();
+        try {
+            switch (sUriMatcher.match(uri)) {
+                case CONTACTS_ID_PHOTO:
+                case CONTACTS_ID_DISPLAY_PHOTO:
+                    return IchthysPickedContacts.contains(picked,
+                            Long.parseLong(segments.get(1)));
+                case CONTACTS_LOOKUP_ID_PHOTO:
+                case CONTACTS_LOOKUP_ID_DISPLAY_PHOTO:
+                    if (!IchthysPickedContacts.contains(picked,
+                            Long.parseLong(segments.get(3)))) {
+                        return false;
+                    }
+                    // fall through: the lookup key must name a picked contact too
+                case CONTACTS_LOOKUP_PHOTO:
+                case CONTACTS_LOOKUP_DISPLAY_PHOTO:
+                case CONTACTS_AS_VCARD:
+                    return IchthysPickedContacts.contains(picked,
+                            lookupContactIdByLookupKey(db, segments.get(2)));
+                case CONTACTS_AS_MULTI_VCARD:
+                    for (String key : segments.get(2).split(":")) {
+                        if (!IchthysPickedContacts.contains(picked,
+                                lookupContactIdByLookupKey(db, Uri.decode(key)))) {
+                            return false;
+                        }
+                    }
+                    return true;
+                case RAW_CONTACTS_ID_DISPLAY_PHOTO:
+                    return IchthysPickedContacts.contains(picked, DatabaseUtils.longForQuery(db,
+                            "SELECT " + RawContacts.CONTACT_ID + " FROM " + Tables.RAW_CONTACTS
+                                    + " WHERE " + RawContacts._ID + "=?",
+                            new String[] {String.valueOf(Long.parseLong(segments.get(1)))}));
+                case DISPLAY_PHOTO_ID:
+                    return IchthysPickedContacts.contains(picked, DatabaseUtils.longForQuery(db,
+                            "SELECT " + RawContacts.CONTACT_ID + " FROM " + Views.DATA
+                                    + " WHERE " + Photo.PHOTO_FILE_ID + "=? AND "
+                                    + Data.MIMETYPE + "=? LIMIT 1",
+                            new String[] {String.valueOf(Long.parseLong(segments.get(1))),
+                                    Photo.CONTENT_ITEM_TYPE}));
+                default:
+                    return false;
+            }
+        } catch (RuntimeException e) {
+            // A malformed id or a row that is gone (SQLiteDoneException): not picked.
+            return false;
+        }
+    }
+
+    /**
+     * {@link #ICHTHYS_GET_PICKED} and {@link #ICHTHYS_SET_PICKED}: {@code arg} is the package,
+     * {@link #ICHTHYS_KEY_LOOKUPS} the lookup keys to store (none clears the set). Both answer
+     * the stored keys. Only the system uid and platform-signed callers (Settings) may call them.
+     */
+    private Bundle callPickedContacts(String method, String pkg, Bundle extras) {
+        final int uid = Binder.getCallingUid();
+        boolean trusted = UserHandle.getAppId(uid) == Process.SYSTEM_UID;
+        if (!trusted) {
+            final long token = Binder.clearCallingIdentity();
+            try {
+                trusted = getContext().getPackageManager().checkSignatures(Process.SYSTEM_UID, uid)
+                        == PackageManager.SIGNATURE_MATCH;
+            } finally {
+                Binder.restoreCallingIdentity(token);
+            }
+        }
+        if (!trusted) {
+            throw new SecurityException("Only the system manages picked contacts");
+        }
+        if (TextUtils.isEmpty(pkg)) {
+            throw new IllegalArgumentException("No package");
+        }
+        if (ICHTHYS_SET_PICKED.equals(method)) {
+            final ArrayList<String> keys =
+                    extras == null ? null : extras.getStringArrayList(ICHTHYS_KEY_LOOKUPS);
+            pickedContacts().setLookupKeys(pkg, keys);
+            Log.i(TAG, "Picked contacts of " + pkg + ": " + (keys == null ? 0 : keys.size()));
+            // Open cursors reload with the new set.
+            final long token = Binder.clearCallingIdentity();
+            try {
+                getContext().getContentResolver().notifyChange(
+                        ContactsContract.AUTHORITY_URI, null, false);
+            } finally {
+                Binder.restoreCallingIdentity(token);
+            }
+        }
+        final Bundle result = new Bundle();
+        result.putStringArrayList(ICHTHYS_KEY_LOOKUPS,
+                new ArrayList<>(pickedContacts().getLookupKeys(pkg)));
+        return result;
     }
 
     @VisibleForTesting
@@ -8310,10 +8627,19 @@ public class ContactsProvider2 extends AbstractContactsProvider
 
         qb.setStrict(true);
 
-        // IchthysOS: contacts lockdown, see query().
+        // IchthysOS: contacts lockdown, see query(). The always-false clause goes on the
+        // builder, never into the caller's selection string: strict mode validates the caller's
+        // selection on its own (unwrapped and wrapped) and ANDs it in afterwards, so a selection
+        // such as "1) OR (1" can't regroup the clause away. Concatenated into one string it
+        // became "(1) OR (1) AND (0)", which is true (verified on device 2026-11-03).
         final boolean readShielded = mReadShield.get() != null;
         if (readShielded) {
-            selection = DbQueryUtils.concatenateClauses(selection, "0");
+            // Picked contacts: a "picked" caller reads the rows of its picked contacts instead,
+            // through the same builder clause, built from integers only.
+            final long[] pickedIds = mPickedIds.get();
+            final String pickedColumn = pickedIds == null ? null : pickedContactColumn(match);
+            qb.appendWhereStandalone(pickedColumn == null
+                    ? "0" : IchthysPickedContacts.inClause(pickedColumn, pickedIds));
         }
 
         // Auto-rewrite SORT_KEY_{PRIMARY, ALTERNATIVE} sort orders.
@@ -8321,9 +8647,6 @@ public class ContactsProvider2 extends AbstractContactsProvider
         Cursor cursor =
                 doQuery(db, qb, projection, selection, selectionArgs, localizedSortOrder, groupBy,
                         having, limit, cancellationSignal);
-        if (readShielded) {
-            mReadShield.set(cursor);
-        }
 
         if (readBooleanQueryParameter(uri, Contacts.EXTRA_ADDRESS_BOOK_INDEX, false)) {
             bundleFastScrollingIndexExtras(cursor, uri, db, qb, selection,
@@ -8332,6 +8655,11 @@ public class ContactsProvider2 extends AbstractContactsProvider
         }
         if (snippetDeferred) {
             cursor = addDeferredSnippetingExtra(cursor);
+        }
+        if (readShielded) {
+            // The cursor that came out of the shielded query, wrappers included (query() empties
+            // or filters any other cursor a restricted caller would get).
+            mReadShield.set(cursor);
         }
 
         return cursor;
@@ -9905,8 +10233,10 @@ public class ContactsProvider2 extends AbstractContactsProvider
                         + "enabled for the user");
                 return null;
             }
-            if (mode.equals("r") && isContactsReadRestricted(uri)) {
-                // IchthysOS: contacts lockdown, the photo and vCard half.
+            if (mode.indexOf('w') < 0 && isContactsReadRestricted(uri) && !isPickedAsset(uri)) {
+                // IchthysOS: contacts lockdown, the photo and vCard half. A "picked" caller
+                // opens the photos and vCards of its picked contacts only. Every mode without
+                // 'w' is a read ("rt" opens display photos just like "r").
                 return null;
             }
             if (!mode.equals("r") && isContactsWriteRestricted()) {

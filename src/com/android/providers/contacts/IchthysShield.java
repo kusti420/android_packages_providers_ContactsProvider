@@ -76,8 +76,8 @@ public final class IchthysShield {
      * Reading contacts (the contacts lockdown, W8b decision 1). Restricted apps keep the
      * permission but see an empty address book. Its switch is the long-standing Settings.Global
      * {@code ichthys_contacts_lockdown}; its allowlist is {@code ichthys_contacts_allowed_pkgs},
-     * where a bare package means real contacts and {@code pkg:picked} (picker not built yet)
-     * still counts as empty.
+     * where a bare package means real contacts and {@code pkg:picked} means only the contacts
+     * picked for it ({@link #isContactsPicked}); for this check a picked app is restricted.
      */
     public static final String FEATURE_CONTACTS = "contacts";
 
@@ -232,6 +232,41 @@ public final class IchthysShield {
             }
         }
         return false;
+    }
+
+    /** The suffix of a "picked contacts only" entry in the contacts list (IchthysShields). */
+    public static final String PICKED_SUFFIX = ":picked";
+
+    /**
+     * Whether the contacts list holds {@code packageName + ":picked"}: the app reads only the
+     * contacts picked for it ({@link IchthysPickedContacts}) instead of an empty book. Only
+     * meaningful for a caller {@link #isRestricted} already shielded from contacts. Unreadable
+     * settings mean not picked (the caller keeps the empty book it already gets).
+     */
+    public static boolean isContactsPicked(Context context, String packageName) {
+        if (context == null || TextUtils.isEmpty(packageName)) {
+            return false;
+        }
+        final String key = allowedPackagesSetting(FEATURE_CONTACTS);
+        final long token = Binder.clearCallingIdentity();
+        try {
+            final String allowed = Settings.Secure.getString(context.getContentResolver(), key);
+            if (TextUtils.isEmpty(allowed)) {
+                return false;
+            }
+            final String entry = packageName + PICKED_SUFFIX;
+            for (String pkg : allowed.split(",")) {
+                if (entry.equals(pkg.trim())) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Failed to read " + key, e);
+            return false;
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
     }
 
     /**
